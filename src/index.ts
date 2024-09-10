@@ -1,629 +1,621 @@
-const DEFAULT_DELIMITER = "/";
-const NOOP_VALUE = (value: string) => value;
-const ID_START = /^[$_\p{ID_Start}]$/u;
-const ID_CONTINUE = /^[$\u200c\u200d\p{ID_Continue}]$/u;
-const DEBUG_URL = "https://git.new/pathToRegexpError";
-
-/**
- * Encode a string into another string.
- */
-export type Encode = (value: string) => string;
-
-/**
- * Decode a string into another string.
- */
-export type Decode = (value: string) => string;
-
-export interface ParseOptions {
-  /**
-   * A function for encoding input strings.
-   */
-  encodePath?: Encode;
-}
-
-export interface PathToRegexpOptions {
-  /**
-   * Matches the path completely without trailing characters. (default: `true`)
-   */
-  end?: boolean;
-  /**
-   * Allows optional trailing delimiter to match. (default: `true`)
-   */
-  trailing?: boolean;
-  /**
-   * Match will be case sensitive. (default: `false`)
-   */
-  sensitive?: boolean;
-  /**
-   * The default delimiter for segments. (default: `'/'`)
-   */
-  delimiter?: string;
-}
-
-export interface MatchOptions extends PathToRegexpOptions {
-  /**
-   * Function for decoding strings for params, or `false` to disable entirely. (default: `decodeURIComponent`)
-   */
-  decode?: Decode | false;
-}
-
-export interface CompileOptions {
-  /**
-   * Function for encoding input strings for output into the path, or `false` to disable entirely. (default: `encodeURIComponent`)
-   */
-  encode?: Encode | false;
-  /**
-   * The default delimiter for segments. (default: `'/'`)
-   */
-  delimiter?: string;
-}
-
-type TokenType =
-  | "{"
-  | "}"
-  | "WILDCARD"
-  | "PARAM"
-  | "CHAR"
-  | "ESCAPED"
-  | "END"
-  // Reserved for use or ambiguous due to past use.
-  | "("
-  | ")"
-  | "["
-  | "]"
-  | "+"
-  | "?"
-  | "!";
-
 /**
  * Tokenizer results.
  */
 interface LexToken {
-  type: TokenType;
+  type:
+    | "OPEN"
+    | "CLOSE"
+    | "PATTERN"
+    | "NAME"
+    | "CHAR"
+    | "ESCAPED_CHAR"
+    | "MODIFIER"
+    | "END";
   index: number;
   value: string;
-}
-
-const SIMPLE_TOKENS: Record<string, TokenType> = {
-  // Groups.
-  "{": "{",
-  "}": "}",
-  // Reserved.
-  "(": "(",
-  ")": ")",
-  "[": "[",
-  "]": "]",
-  "+": "+",
-  "?": "?",
-  "!": "!",
-};
-
-/**
- * Escape text for stringify to path.
- */
-function escapeText(str: string) {
-  return str.replace(/[{}()\[\]+?!:*]/g, "\\$&");
-}
-
-/**
- * Escape a regular expression string.
- */
-function escape(str: string) {
-  return str.replace(/[.+*?^${}()[\]|/\\]/g, "\\$&");
 }
 
 /**
  * Tokenize input string.
  */
-function* lexer(str: string): Generator<LexToken, LexToken> {
-  const chars = [...str];
+function lexer(str: string): LexToken[] {
+  const tokens: LexToken[] = [];
   let i = 0;
 
-  function name() {
-    let value = "";
+  while (i < str.length) {
+    const char = str[i];
 
-    if (ID_START.test(chars[++i])) {
-      value += chars[i];
-      while (ID_CONTINUE.test(chars[++i])) {
-        value += chars[i];
-      }
-    } else if (chars[i] === '"') {
-      let pos = i;
+    if (char === "*" || char === "+" || char === "?") {
+      tokens.push({ type: "MODIFIER", index: i, value: str[i++] });
+      continue;
+    }
 
-      while (i < chars.length) {
-        if (chars[++i] === '"') {
-          i++;
-          pos = 0;
-          break;
+    if (char === "\\") {
+      tokens.push({ type: "ESCAPED_CHAR", index: i++, value: str[i++] });
+      continue;
+    }
+
+    if (char === "{") {
+      tokens.push({ type: "OPEN", index: i, value: str[i++] });
+      continue;
+    }
+
+    if (char === "}") {
+      tokens.push({ type: "CLOSE", index: i, value: str[i++] });
+      continue;
+    }
+
+    if (char === ":") {
+      let name = "";
+      let j = i + 1;
+
+      while (j < str.length) {
+        const code = str.charCodeAt(j);
+
+        if (
+          // `0-9`
+          (code >= 48 && code <= 57) ||
+          // `A-Z`
+          (code >= 65 && code <= 90) ||
+          // `a-z`
+          (code >= 97 && code <= 122) ||
+          // `_`
+          code === 95
+        ) {
+          name += str[j++];
+          continue;
         }
 
-        if (chars[i] === "\\") {
-          value += chars[++i];
-        } else {
-          value += chars[i];
+        break;
+      }
+
+      if (!name) throw new TypeError(`Missing parameter name at ${i}`);
+
+      tokens.push({ type: "NAME", index: i, value: name });
+      i = j;
+      continue;
+    }
+
+    if (char === "(") {
+      let count = 1;
+      let pattern = "";
+      let j = i + 1;
+
+      if (str[j] === "?") {
+        throw new TypeError(`Pattern cannot start with "?" at ${j}`);
+      }
+
+      while (j < str.length) {
+        if (str[j] === "\\") {
+          pattern += str[j++] + str[j++];
+          continue;
         }
+
+        if (str[j] === ")") {
+          count--;
+          if (count === 0) {
+            j++;
+            break;
+          }
+        } else if (str[j] === "(") {
+          count++;
+          if (str[j + 1] !== "?") {
+            throw new TypeError(`Capturing groups are not allowed at ${j}`);
+          }
+        }
+
+        pattern += str[j++];
       }
 
-      if (pos) {
-        throw new TypeError(`Unterminated quote at ${pos}: ${DEBUG_URL}`);
-      }
+      if (count) throw new TypeError(`Unbalanced pattern at ${i}`);
+      if (!pattern) throw new TypeError(`Missing pattern at ${i}`);
+
+      tokens.push({ type: "PATTERN", index: i, value: pattern });
+      i = j;
+      continue;
     }
 
-    if (!value) {
-      throw new TypeError(`Missing parameter name at ${i}: ${DEBUG_URL}`);
-    }
-
-    return value;
+    tokens.push({ type: "CHAR", index: i, value: str[i++] });
   }
 
-  while (i < chars.length) {
-    const value = chars[i];
-    const type = SIMPLE_TOKENS[value];
+  tokens.push({ type: "END", index: i, value: "" });
 
-    if (type) {
-      yield { type, index: i++, value };
-    } else if (value === "\\") {
-      yield { type: "ESCAPED", index: i++, value: chars[i++] };
-    } else if (value === ":") {
-      const value = name();
-      yield { type: "PARAM", index: i, value };
-    } else if (value === "*") {
-      const value = name();
-      yield { type: "WILDCARD", index: i, value };
-    } else {
-      yield { type: "CHAR", index: i, value: chars[i++] };
-    }
-  }
-
-  return { type: "END", index: i, value: "" };
+  return tokens;
 }
 
-class Iter {
-  #peek?: LexToken;
-
-  constructor(private tokens: Generator<LexToken, LexToken>) {}
-
-  peek(): LexToken {
-    if (!this.#peek) {
-      const next = this.tokens.next();
-      this.#peek = next.value;
-    }
-    return this.#peek;
-  }
-
-  tryConsume(type: TokenType): string | undefined {
-    const token = this.peek();
-    if (token.type !== type) return;
-    this.#peek = undefined; // Reset after consumed.
-    return token.value;
-  }
-
-  consume(type: TokenType): string {
-    const value = this.tryConsume(type);
-    if (value !== undefined) return value;
-    const { type: nextType, index } = this.peek();
-    throw new TypeError(
-      `Unexpected ${nextType} at ${index}, expected ${type}: ${DEBUG_URL}`,
-    );
-  }
-
-  text(): string {
-    let result = "";
-    let value: string | undefined;
-    while ((value = this.tryConsume("CHAR") || this.tryConsume("ESCAPED"))) {
-      result += value;
-    }
-    return result;
-  }
-}
-
-/**
- * Plain text.
- */
-export interface Text {
-  type: "text";
-  value: string;
-}
-
-/**
- * A parameter designed to match arbitrary text within a segment.
- */
-export interface Parameter {
-  type: "param";
-  name: string;
-}
-
-/**
- * A wildcard parameter designed to match multiple segments.
- */
-export interface Wildcard {
-  type: "wildcard";
-  name: string;
-}
-
-/**
- * A set of possible tokens to expand when matching.
- */
-export interface Group {
-  type: "group";
-  tokens: Token[];
-}
-
-/**
- * A token that corresponds with a regexp capture.
- */
-export type Key = Parameter | Wildcard;
-
-/**
- * A sequence of `path-to-regexp` keys that match capturing groups.
- */
-export type Keys = Array<Key>;
-
-/**
- * A sequence of path match characters.
- */
-export type Token = Text | Parameter | Wildcard | Group;
-
-/**
- * Tokenized path instance.
- */
-export class TokenData {
-  constructor(public readonly tokens: Token[]) {}
+export interface ParseOptions {
+  /**
+   * Set the default delimiter for repeat parameters. (default: `'/'`)
+   */
+  delimiter?: string;
+  /**
+   * List of characters to automatically consider prefixes when parsing.
+   */
+  prefixes?: string;
 }
 
 /**
  * Parse a string for the raw tokens.
  */
-export function parse(str: string, options: ParseOptions = {}): TokenData {
-  const { encodePath = NOOP_VALUE } = options;
-  const it = new Iter(lexer(str));
+export function parse(str: string, options: ParseOptions = {}): Token[] {
+  const tokens = lexer(str);
+  const { prefixes = "./" } = options;
+  const defaultPattern = `[^${escapeString(options.delimiter || "/#?")}]+?`;
+  const result: Token[] = [];
+  let key = 0;
+  let i = 0;
+  let path = "";
 
-  function consume(endType: TokenType): Token[] {
-    const tokens: Token[] = [];
+  const tryConsume = (type: LexToken["type"]): string | undefined => {
+    if (i < tokens.length && tokens[i].type === type) return tokens[i++].value;
+  };
 
-    while (true) {
-      const path = it.text();
-      if (path) tokens.push({ type: "text", value: encodePath(path) });
+  const mustConsume = (type: LexToken["type"]): string => {
+    const value = tryConsume(type);
+    if (value !== undefined) return value;
+    const { type: nextType, index } = tokens[i];
+    throw new TypeError(`Unexpected ${nextType} at ${index}, expected ${type}`);
+  };
 
-      const param = it.tryConsume("PARAM");
-      if (param) {
-        tokens.push({
-          type: "param",
-          name: param,
-        });
-        continue;
-      }
-
-      const wildcard = it.tryConsume("WILDCARD");
-      if (wildcard) {
-        tokens.push({
-          type: "wildcard",
-          name: wildcard,
-        });
-        continue;
-      }
-
-      const open = it.tryConsume("{");
-      if (open) {
-        tokens.push({
-          type: "group",
-          tokens: consume("}"),
-        });
-        continue;
-      }
-
-      it.consume(endType);
-      return tokens;
+  const consumeText = (): string => {
+    let result = "";
+    let value: string | undefined;
+    while ((value = tryConsume("CHAR") || tryConsume("ESCAPED_CHAR"))) {
+      result += value;
     }
+    return result;
+  };
+
+  while (i < tokens.length) {
+    const char = tryConsume("CHAR");
+    const name = tryConsume("NAME");
+    const pattern = tryConsume("PATTERN");
+
+    if (name || pattern) {
+      let prefix = char || "";
+
+      if (prefixes.indexOf(prefix) === -1) {
+        path += prefix;
+        prefix = "";
+      }
+
+      if (path) {
+        result.push(path);
+        path = "";
+      }
+
+      result.push({
+        name: name || key++,
+        prefix,
+        suffix: "",
+        pattern: pattern || defaultPattern,
+        modifier: tryConsume("MODIFIER") || "",
+      });
+      continue;
+    }
+
+    const value = char || tryConsume("ESCAPED_CHAR");
+    if (value) {
+      path += value;
+      continue;
+    }
+
+    if (path) {
+      result.push(path);
+      path = "";
+    }
+
+    const open = tryConsume("OPEN");
+    if (open) {
+      const prefix = consumeText();
+      const name = tryConsume("NAME") || "";
+      const pattern = tryConsume("PATTERN") || "";
+      const suffix = consumeText();
+
+      mustConsume("CLOSE");
+
+      result.push({
+        name: name || (pattern ? key++ : ""),
+        pattern: name && !pattern ? defaultPattern : pattern,
+        prefix,
+        suffix,
+        modifier: tryConsume("MODIFIER") || "",
+      });
+      continue;
+    }
+
+    mustConsume("END");
   }
 
-  const tokens = consume("END");
-  return new TokenData(tokens);
+  return result;
+}
+
+export interface TokensToFunctionOptions {
+  /**
+   * When `true` the regexp will be case sensitive. (default: `false`)
+   */
+  sensitive?: boolean;
+  /**
+   * Function for encoding input strings for output.
+   */
+  encode?: (value: string, token: Key) => string;
+  /**
+   * When `false` the function can produce an invalid (unmatched) path. (default: `true`)
+   */
+  validate?: boolean;
 }
 
 /**
  * Compile a string to a template function for the path.
  */
-export function compile<P extends ParamData = ParamData>(
-  path: Path,
-  options: CompileOptions & ParseOptions = {},
+export function compile<P extends object = object>(
+  str: string,
+  options?: ParseOptions & TokensToFunctionOptions,
 ) {
-  const { encode = encodeURIComponent, delimiter = DEFAULT_DELIMITER } =
-    options;
-  const data = path instanceof TokenData ? path : parse(path, options);
-  const fn = tokensToFunction(data.tokens, delimiter, encode);
+  return tokensToFunction<P>(parse(str, options), options);
+}
 
-  return function path(data: P = {} as P) {
-    const [path, ...missing] = fn(data);
-    if (missing.length) {
-      throw new TypeError(`Missing parameters: ${missing.join(", ")}`);
+export type PathFunction<P extends object = object> = (data?: P) => string;
+
+/**
+ * Expose a method for transforming tokens into the path function.
+ */
+export function tokensToFunction<P extends object = object>(
+  tokens: Token[],
+  options: TokensToFunctionOptions = {},
+): PathFunction<P> {
+  const reFlags = flags(options);
+  const { encode = (x: string) => x, validate = true } = options;
+
+  // Compile all the tokens into regexps.
+  const matches = tokens.map((token) => {
+    if (typeof token === "object") {
+      return new RegExp(`^(?:${token.pattern})$`, reFlags);
     }
+  });
+
+  return (data: Record<string, any> | null | undefined) => {
+    let path = "";
+
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+
+      if (typeof token === "string") {
+        path += token;
+        continue;
+      }
+
+      const value = data ? data[token.name] : undefined;
+      const optional = token.modifier === "?" || token.modifier === "*";
+      const repeat = token.modifier === "*" || token.modifier === "+";
+
+      if (Array.isArray(value)) {
+        if (!repeat) {
+          throw new TypeError(
+            `Expected "${token.name}" to not repeat, but got an array`,
+          );
+        }
+
+        if (value.length === 0) {
+          if (optional) continue;
+
+          throw new TypeError(`Expected "${token.name}" to not be empty`);
+        }
+
+        for (let j = 0; j < value.length; j++) {
+          const segment = encode(value[j], token);
+
+          if (validate && !(matches[i] as RegExp).test(segment)) {
+            throw new TypeError(
+              `Expected all "${token.name}" to match "${token.pattern}", but got "${segment}"`,
+            );
+          }
+
+          path += token.prefix + segment + token.suffix;
+        }
+
+        continue;
+      }
+
+      if (typeof value === "string" || typeof value === "number") {
+        const segment = encode(String(value), token);
+
+        if (validate && !(matches[i] as RegExp).test(segment)) {
+          throw new TypeError(
+            `Expected "${token.name}" to match "${token.pattern}", but got "${segment}"`,
+          );
+        }
+
+        path += token.prefix + segment + token.suffix;
+        continue;
+      }
+
+      if (optional) continue;
+
+      const typeOfMessage = repeat ? "an array" : "a string";
+      throw new TypeError(`Expected "${token.name}" to be ${typeOfMessage}`);
+    }
+
     return path;
   };
 }
 
-export type ParamData = Partial<Record<string, string | string[]>>;
-export type PathFunction<P extends ParamData> = (data?: P) => string;
-
-function tokensToFunction(
-  tokens: Token[],
-  delimiter: string,
-  encode: Encode | false,
-) {
-  const encoders = tokens.map((token) =>
-    tokenToFunction(token, delimiter, encode),
-  );
-
-  return (data: ParamData) => {
-    const result: string[] = [""];
-
-    for (const encoder of encoders) {
-      const [value, ...extras] = encoder(data);
-      result[0] += value;
-      result.push(...extras);
-    }
-
-    return result;
-  };
-}
-
-/**
- * Convert a single token into a path building function.
- */
-function tokenToFunction(
-  token: Token,
-  delimiter: string,
-  encode: Encode | false,
-): (data: ParamData) => string[] {
-  if (token.type === "text") return () => [token.value];
-
-  if (token.type === "group") {
-    const fn = tokensToFunction(token.tokens, delimiter, encode);
-
-    return (data) => {
-      const [value, ...missing] = fn(data);
-      if (!missing.length) return [value];
-      return [""];
-    };
-  }
-
-  const encodeValue = encode || NOOP_VALUE;
-
-  if (token.type === "wildcard" && encode !== false) {
-    return (data) => {
-      const value = data[token.name];
-      if (value == null) return ["", token.name];
-
-      if (!Array.isArray(value) || value.length === 0) {
-        throw new TypeError(`Expected "${token.name}" to be a non-empty array`);
-      }
-
-      return [
-        value
-          .map((value, index) => {
-            if (typeof value !== "string") {
-              throw new TypeError(
-                `Expected "${token.name}/${index}" to be a string`,
-              );
-            }
-
-            return encodeValue(value);
-          })
-          .join(delimiter),
-      ];
-    };
-  }
-
-  return (data) => {
-    const value = data[token.name];
-    if (value == null) return ["", token.name];
-
-    if (typeof value !== "string") {
-      throw new TypeError(`Expected "${token.name}" to be a string`);
-    }
-
-    return [encodeValue(value)];
-  };
+export interface RegexpToFunctionOptions {
+  /**
+   * Function for decoding strings for params.
+   */
+  decode?: (value: string, token: Key) => string;
 }
 
 /**
  * A match result contains data about the path match.
  */
-export interface MatchResult<P extends ParamData> {
+export interface MatchResult<P extends object = object> {
   path: string;
+  index: number;
   params: P;
 }
 
 /**
  * A match is either `false` (no match) or a match result.
  */
-export type Match<P extends ParamData> = false | MatchResult<P>;
+export type Match<P extends object = object> = false | MatchResult<P>;
 
 /**
  * The match function takes a string and returns whether it matched the path.
  */
-export type MatchFunction<P extends ParamData> = (path: string) => Match<P>;
+export type MatchFunction<P extends object = object> = (
+  path: string,
+) => Match<P>;
 
 /**
- * Supported path types.
+ * Create path match function from `path-to-regexp` spec.
  */
-export type Path = string | TokenData;
+export function match<P extends object = object>(
+  str: Path,
+  options?: ParseOptions & TokensToRegexpOptions & RegexpToFunctionOptions,
+) {
+  const keys: Key[] = [];
+  const re = pathToRegexp(str, keys, options);
+  return regexpToFunction<P>(re, keys, options);
+}
 
 /**
- * Transform a path into a match function.
+ * Create a path match function from `path-to-regexp` output.
  */
-export function match<P extends ParamData>(
-  path: Path | Path[],
-  options: MatchOptions & ParseOptions = {},
+export function regexpToFunction<P extends object = object>(
+  re: RegExp,
+  keys: Key[],
+  options: RegexpToFunctionOptions = {},
 ): MatchFunction<P> {
-  const { decode = decodeURIComponent, delimiter = DEFAULT_DELIMITER } =
-    options;
-  const { regexp, keys } = pathToRegexp(path, options);
+  const { decode = (x: string) => x } = options;
 
-  const decoders = keys.map((key) => {
-    if (decode === false) return NOOP_VALUE;
-    if (key.type === "param") return decode;
-    return (value: string) => value.split(delimiter).map(decode);
-  });
-
-  return function match(input: string) {
-    const m = regexp.exec(input);
+  return function (pathname: string) {
+    const m = re.exec(pathname);
     if (!m) return false;
 
-    const path = m[0];
+    const { 0: path, index } = m;
     const params = Object.create(null);
 
     for (let i = 1; i < m.length; i++) {
       if (m[i] === undefined) continue;
 
       const key = keys[i - 1];
-      const decoder = decoders[i - 1];
-      params[key.name] = decoder(m[i]);
+
+      if (key.modifier === "*" || key.modifier === "+") {
+        params[key.name] = m[i].split(key.prefix + key.suffix).map((value) => {
+          return decode(value, key);
+        });
+      } else {
+        params[key.name] = decode(m[i], key);
+      }
     }
 
-    return { path, params };
+    return { path, index, params };
   };
 }
 
-export function pathToRegexp(
-  path: Path | Path[],
-  options: PathToRegexpOptions & ParseOptions = {},
+/**
+ * Escape a regular expression string.
+ */
+function escapeString(str: string) {
+  return str.replace(/([.+*?=^!:${}()[\]|/\\])/g, "\\$1");
+}
+
+/**
+ * Get the flags for a regexp from the options.
+ */
+function flags(options?: { sensitive?: boolean }) {
+  return options && options.sensitive ? "" : "i";
+}
+
+/**
+ * Metadata about a key.
+ */
+export interface Key {
+  name: string | number;
+  prefix: string;
+  suffix: string;
+  pattern: string;
+  modifier: string;
+}
+
+/**
+ * A token is a string (nothing special) or key metadata (capture group).
+ */
+export type Token = string | Key;
+
+/**
+ * Pull out keys from a regexp.
+ */
+function regexpToRegexp(path: RegExp, keys?: Key[]): RegExp {
+  if (!keys) return path;
+
+  const groupsRegex = /\((?:\?<(.*?)>)?(?!\?)/g;
+
+  let index = 0;
+  let execResult = groupsRegex.exec(path.source);
+  while (execResult) {
+    keys.push({
+      // Use parenthesized substring match if available, index otherwise
+      name: execResult[1] || index++,
+      prefix: "",
+      suffix: "",
+      modifier: "",
+      pattern: "",
+    });
+    execResult = groupsRegex.exec(path.source);
+  }
+
+  return path;
+}
+
+/**
+ * Transform an array into a regexp.
+ */
+function arrayToRegexp(
+  paths: Array<string | RegExp>,
+  keys?: Key[],
+  options?: TokensToRegexpOptions & ParseOptions,
+): RegExp {
+  const parts = paths.map((path) => pathToRegexp(path, keys, options).source);
+  return new RegExp(`(?:${parts.join("|")})`, flags(options));
+}
+
+/**
+ * Create a path regexp from string input.
+ */
+function stringToRegexp(
+  path: string,
+  keys?: Key[],
+  options?: TokensToRegexpOptions & ParseOptions,
+) {
+  return tokensToRegexp(parse(path, options), keys, options);
+}
+
+export interface TokensToRegexpOptions {
+  /**
+   * When `true` the regexp will be case sensitive. (default: `false`)
+   */
+  sensitive?: boolean;
+  /**
+   * When `true` the regexp won't allow an optional trailing delimiter to match. (default: `false`)
+   */
+  strict?: boolean;
+  /**
+   * When `true` the regexp will match to the end of the string. (default: `true`)
+   */
+  end?: boolean;
+  /**
+   * When `true` the regexp will match from the beginning of the string. (default: `true`)
+   */
+  start?: boolean;
+  /**
+   * Sets the final character for non-ending optimistic matches. (default: `/`)
+   */
+  delimiter?: string;
+  /**
+   * List of characters that can also be "end" characters.
+   */
+  endsWith?: string;
+  /**
+   * Encode path tokens for use in the `RegExp`.
+   */
+  encode?: (value: string) => string;
+}
+
+/**
+ * Expose a function for taking tokens and returning a RegExp.
+ */
+export function tokensToRegexp(
+  tokens: Token[],
+  keys?: Key[],
+  options: TokensToRegexpOptions = {},
 ) {
   const {
-    delimiter = DEFAULT_DELIMITER,
+    strict = false,
+    start = true,
     end = true,
-    sensitive = false,
-    trailing = true,
+    encode = (x: string) => x,
+    delimiter = "/#?",
+    endsWith = "",
   } = options;
-  const keys: Keys = [];
-  const sources: string[] = [];
-  const flags = sensitive ? "s" : "is";
-  const paths = Array.isArray(path) ? path : [path];
-  const items = paths.map((path) =>
-    path instanceof TokenData ? path : parse(path, options),
-  );
+  const endsWithRe = `[${escapeString(endsWith)}]|$`;
+  const delimiterRe = `[${escapeString(delimiter)}]`;
+  let route = start ? "^" : "";
 
-  for (const { tokens } of items) {
-    for (const seq of flatten(tokens, 0, [])) {
-      const regexp = sequenceToRegExp(seq, delimiter, keys);
-      sources.push(regexp);
-    }
-  }
+  // Iterate over the tokens and create our regexp string.
+  for (const token of tokens) {
+    if (typeof token === "string") {
+      route += escapeString(encode(token));
+    } else {
+      const prefix = escapeString(encode(token.prefix));
+      const suffix = escapeString(encode(token.suffix));
 
-  let pattern = `^(?:${sources.join("|")})`;
-  if (trailing) pattern += `(?:${escape(delimiter)}$)?`;
-  pattern += end ? "$" : `(?=${escape(delimiter)}|$)`;
+      if (token.pattern) {
+        if (keys) keys.push(token);
 
-  const regexp = new RegExp(pattern, flags);
-  return { regexp, keys };
-}
-
-/**
- * Flattened token set.
- */
-type Flattened = Text | Parameter | Wildcard;
-
-/**
- * Generate a flat list of sequence tokens from the given tokens.
- */
-function* flatten(
-  tokens: Token[],
-  index: number,
-  init: Flattened[],
-): Generator<Flattened[]> {
-  if (index === tokens.length) {
-    return yield init;
-  }
-
-  const token = tokens[index];
-
-  if (token.type === "group") {
-    const fork = init.slice();
-    for (const seq of flatten(token.tokens, 0, fork)) {
-      yield* flatten(tokens, index + 1, seq);
-    }
-  } else {
-    init.push(token);
-  }
-
-  yield* flatten(tokens, index + 1, init);
-}
-
-/**
- * Transform a flat sequence of tokens into a regular expression.
- */
-function sequenceToRegExp(tokens: Flattened[], delimiter: string, keys: Keys) {
-  let result = "";
-  let backtrack = "";
-  let isSafeSegmentParam = true;
-
-  for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i];
-
-    if (token.type === "text") {
-      result += escape(token.value);
-      backtrack = token.value;
-      isSafeSegmentParam ||= token.value.includes(delimiter);
-      continue;
-    }
-
-    if (token.type === "param" || token.type === "wildcard") {
-      if (!isSafeSegmentParam && !backtrack) {
-        throw new TypeError(`Missing text after "${token.name}": ${DEBUG_URL}`);
-      }
-
-      if (token.type === "param") {
-        result += `(${negate(delimiter, isSafeSegmentParam ? "" : backtrack)}+)`;
+        if (prefix || suffix) {
+          if (token.modifier === "+" || token.modifier === "*") {
+            const mod = token.modifier === "*" ? "?" : "";
+            route += `(?:${prefix}((?:${token.pattern})(?:${suffix}${prefix}(?:${token.pattern}))*)${suffix})${mod}`;
+          } else {
+            route += `(?:${prefix}(${token.pattern})${suffix})${token.modifier}`;
+          }
+        } else {
+          if (token.modifier === "+" || token.modifier === "*") {
+            route += `((?:${token.pattern})${token.modifier})`;
+          } else {
+            route += `(${token.pattern})${token.modifier}`;
+          }
+        }
       } else {
-        result += `(.+)`;
+        route += `(?:${prefix}${suffix})${token.modifier}`;
       }
-
-      keys.push(token);
-      backtrack = "";
-      isSafeSegmentParam = false;
-      continue;
     }
   }
 
-  return result;
-}
+  if (end) {
+    if (!strict) route += `${delimiterRe}?`;
 
-function negate(delimiter: string, backtrack: string) {
-  const values = [delimiter, backtrack].filter(Boolean);
-  const isSimple = values.every((value) => value.length === 1);
-  if (isSimple) return `[^${escape(values.join(""))}]`;
-  return `(?:(?!${values.map(escape).join("|")}).)`;
+    route += !options.endsWith ? "$" : `(?=${endsWithRe})`;
+  } else {
+    const endToken = tokens[tokens.length - 1];
+    const isEndDelimited =
+      typeof endToken === "string"
+        ? delimiterRe.indexOf(endToken[endToken.length - 1]) > -1
+        : endToken === undefined;
+
+    if (!strict) {
+      route += `(?:${delimiterRe}(?=${endsWithRe}))?`;
+    }
+
+    if (!isEndDelimited) {
+      route += `(?=${delimiterRe}|${endsWithRe})`;
+    }
+  }
+
+  return new RegExp(route, flags(options));
 }
 
 /**
- * Stringify token data into a path string.
+ * Supported `path-to-regexp` input types.
  */
-export function stringify(data: TokenData) {
-  return data.tokens
-    .map(function stringifyToken(token, index, tokens): string {
-      if (token.type === "text") return escapeText(token.value);
-      if (token.type === "group") {
-        return `{${token.tokens.map(stringifyToken).join("")}}`;
-      }
+export type Path = string | RegExp | Array<string | RegExp>;
 
-      const isSafe =
-        isNameSafe(token.name) && isNextNameSafe(tokens[index + 1]);
-      const key = isSafe ? token.name : JSON.stringify(token.name);
-
-      if (token.type === "param") return `:${key}`;
-      if (token.type === "wildcard") return `*${key}`;
-      throw new TypeError(`Unexpected token: ${token}`);
-    })
-    .join("");
-}
-
-function isNameSafe(name: string) {
-  const [first, ...rest] = name;
-  if (!ID_START.test(first)) return false;
-  return rest.every((char) => ID_CONTINUE.test(char));
-}
-
-function isNextNameSafe(token: Token | undefined) {
-  if (token?.type !== "text") return true;
-  return !ID_CONTINUE.test(token.value[0]);
+/**
+ * Normalize the given path string, returning a regular expression.
+ *
+ * An empty array can be passed in for the keys, which will hold the
+ * placeholder key descriptions. For example, using `/user/:id`, `keys` will
+ * contain `[{ name: 'id', delimiter: '/', optional: false, repeat: false }]`.
+ */
+export function pathToRegexp(
+  path: Path,
+  keys?: Key[],
+  options?: TokensToRegexpOptions & ParseOptions,
+) {
+  if (path instanceof RegExp) return regexpToRegexp(path, keys);
+  if (Array.isArray(path)) return arrayToRegexp(path, keys, options);
+  return stringToRegexp(path, keys, options);
 }
